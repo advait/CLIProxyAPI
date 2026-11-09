@@ -821,6 +821,9 @@ func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model stri
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
 	}
+	if until, exhausted := usageExhaustedUntil(auth, now); exhausted {
+		return true, blockReasonCooldown, until
+	}
 	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
 	if model != "" {
 		if len(auth.ModelStates) > 0 {

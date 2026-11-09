@@ -531,7 +531,8 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first",
+	// "usage-aware" (fork addition; see UsageAwareRoutingConfig).
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -563,6 +564,33 @@ type RoutingConfig struct {
 	//     keep the binding and return the error (or retry the same credential) instead.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// UsageAware configures the "usage-aware" strategy (fork addition). Ignored by
+	// other strategies.
+	UsageAware UsageAwareRoutingConfig `yaml:"usage-aware,omitempty" json:"usage-aware,omitempty"`
+}
+
+// UsageAwareRoutingConfig tunes the "usage-aware" routing strategy. CPA polls each
+// Claude and Codex OAuth credential's subscription usage, caches the results, and
+// binds new sessions to the credential with the best score:
+//
+//	primary-weight*primaryRemaining% + secondary-weight*secondaryRemaining% + reset-credit bonus
+//
+// where each available Codex banked reset adds reset-credit-weight/(1+daysToExpiry/7).
+// Credentials whose polled usage shows a hit limit are unavailable until the window
+// resets, including for sessions already bound to them (paid overage is never used).
+type UsageAwareRoutingConfig struct {
+	// PollInterval is how often usage is fetched. Default "5m"; minimum "1m".
+	PollInterval string `yaml:"poll-interval,omitempty" json:"poll-interval,omitempty"`
+	// CacheFile persists polled usage across restarts. Default: usage-cache.json next to
+	// the auth directory (not inside it, so it is never loaded as a credential).
+	CacheFile string `yaml:"cache-file,omitempty" json:"cache-file,omitempty"`
+	// PrimaryWeight scales remaining percent in the short window (Claude 5h, Codex primary). Default 1000.
+	PrimaryWeight *float64 `yaml:"primary-weight,omitempty" json:"primary-weight,omitempty"`
+	// SecondaryWeight scales remaining percent in the long window (weekly). Default 1.
+	SecondaryWeight *float64 `yaml:"secondary-weight,omitempty" json:"secondary-weight,omitempty"`
+	// ResetCreditWeight is the bonus for one banked reset at expiry. Default 100000.
+	ResetCreditWeight *float64 `yaml:"reset-credit-weight,omitempty" json:"reset-credit-weight,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
