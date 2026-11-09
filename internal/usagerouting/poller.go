@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +90,30 @@ type Poller struct {
 	now     func() time.Time
 
 	loadOnce sync.Once
+	pollMu   sync.Mutex
 	wake     chan struct{}
+}
+
+var (
+	activeMu sync.RWMutex
+	active   *Poller
+)
+
+// Refresh polls every credential immediately using the running poller.
+func Refresh(ctx context.Context) error {
+	activeMu.RLock()
+	p := active
+	activeMu.RUnlock()
+	if p == nil {
+		return fmt.Errorf("usage poller is not running")
+	}
+	settings := SettingsFromConfig(p.config())
+	if !settings.Enabled {
+		return fmt.Errorf("routing.strategy is not %q", Strategy)
+	}
+	p.loadOnce.Do(func() { p.loadState(settings.CacheFile) })
+	p.PollOnce(ctx, settings)
+	return nil
 }
 
 // NewPoller creates a poller reading credentials from manager and settings from cfgFn.
@@ -116,11 +140,14 @@ func (p *Poller) Wake() {
 // Run polls until ctx is cancelled. Settings are re-read every cycle so config
 // hot reloads take effect without a restart.
 func (p *Poller) Run(ctx context.Context) {
+	activeMu.Lock()
+	active = p
+	activeMu.Unlock()
 	for {
 		settings := SettingsFromConfig(p.config())
 		coreauth.ConfigureUsageRouting(settings.Enabled, settings.Weights, settings.PollInterval)
 		if settings.Enabled {
-			p.loadOnce.Do(func() { p.loadCache(settings.CacheFile) })
+			p.loadOnce.Do(func() { p.loadState(settings.CacheFile) })
 			p.PollOnce(ctx, settings)
 		}
 		timer := time.NewTimer(settings.PollInterval)
@@ -137,8 +164,11 @@ func (p *Poller) Run(ctx context.Context) {
 
 // PollOnce refreshes every eligible credential and persists the cache.
 func (p *Poller) PollOnce(ctx context.Context, settings Settings) {
+	p.pollMu.Lock()
+	defer p.pollMu.Unlock()
 	cfg := p.config()
 	seen := make(map[string]struct{})
+	var samples []coreauth.UsageSample
 	for _, auth := range p.manager.List() {
 		provider, ok := eligibleProvider(auth)
 		if !ok {
@@ -152,6 +182,7 @@ func (p *Poller) PollOnce(ctx context.Context, settings Settings) {
 			continue
 		}
 		coreauth.StoreUsageSnapshot(snapshot)
+		samples = append(samples, coreauth.SampleFromSnapshot(snapshot))
 		log.Debugf("usage routing: %s primary=%s secondary=%s", auth.ID, describeWindow(snapshot.Primary), describeWindow(snapshot.Secondary))
 	}
 	for _, snapshot := range coreauth.UsageSnapshots() {
@@ -160,6 +191,75 @@ func (p *Poller) PollOnce(ctx context.Context, settings Settings) {
 		}
 	}
 	p.saveCache(settings.CacheFile)
+	coreauth.AppendUsageHistory(samples...)
+	appendHistoryFile(historyFile(settings.CacheFile), samples)
+}
+
+// historyFile is the JSONL usage history kept next to the cache file.
+func historyFile(cacheFile string) string {
+	if cacheFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(cacheFile), "usage-history.jsonl")
+}
+
+func appendHistoryFile(path string, samples []coreauth.UsageSample) {
+	if path == "" || len(samples) == 0 {
+		return
+	}
+	fh, errOpen := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if errOpen != nil {
+		log.Warnf("usage routing: open history %s: %v", path, errOpen)
+		return
+	}
+	defer func() {
+		if errClose := fh.Close(); errClose != nil {
+			log.Warnf("usage routing: close history %s: %v", path, errClose)
+		}
+	}()
+	encoder := json.NewEncoder(fh)
+	for _, sample := range samples {
+		if errEncode := encoder.Encode(sample); errEncode != nil {
+			log.Warnf("usage routing: write history %s: %v", path, errEncode)
+			return
+		}
+	}
+}
+
+// loadHistory reads retained samples and rewrites the file without expired ones.
+func (p *Poller) loadHistory(path string) {
+	if path == "" {
+		return
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		if !os.IsNotExist(errRead) {
+			log.Warnf("usage routing: read history %s: %v", path, errRead)
+		}
+		return
+	}
+	cutoff := p.now().Add(-coreauth.UsageHistoryRetention)
+	var kept []coreauth.UsageSample
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var sample coreauth.UsageSample
+		if errDecode := json.Unmarshal([]byte(line), &sample); errDecode != nil || sample.At.Before(cutoff) {
+			continue
+		}
+		kept = append(kept, sample)
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].At.Before(kept[j].At) })
+	coreauth.AppendUsageHistory(kept...)
+	tmp := path + ".tmp"
+	if errWrite := os.WriteFile(tmp, nil, 0o600); errWrite == nil {
+		appendHistoryFile(tmp, kept)
+		if errRename := os.Rename(tmp, path); errRename != nil {
+			log.Warnf("usage routing: compact history %s: %v", path, errRename)
+		}
+	}
+	log.Infof("usage routing: loaded %d usage history samples", len(kept))
 }
 
 func eligibleProvider(auth *coreauth.Auth) (string, bool) {
@@ -193,7 +293,7 @@ func metadataString(auth *coreauth.Auth, key string) string {
 }
 
 func (p *Poller) fetch(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, provider string) (coreauth.UsageSnapshot, error) {
-	snapshot := coreauth.UsageSnapshot{AuthID: auth.ID, Provider: provider, Email: metadataString(auth, "email")}
+	snapshot := coreauth.UsageSnapshot{AuthID: auth.ID, Provider: provider, Email: metadataString(auth, "email"), Plan: metadataString(auth, "plan_type")}
 	headers := http.Header{"Authorization": {"Bearer " + accessToken(auth)}, "Accept": {"application/json"}}
 	switch provider {
 	case "claude":
@@ -255,16 +355,16 @@ func (p *Poller) get(ctx context.Context, cfg *config.Config, auth *coreauth.Aut
 // parseClaudeUsage reads /api/oauth/usage: five_hour and seven_day carry
 // utilization (percent) and resets_at (RFC 3339).
 func parseClaudeUsage(body []byte, snapshot *coreauth.UsageSnapshot) {
-	snapshot.Primary = claudeWindow(ojson.GetBytes(body, "five_hour"))
-	snapshot.Secondary = claudeWindow(ojson.GetBytes(body, "seven_day"))
+	snapshot.Primary = claudeWindow(ojson.GetBytes(body, "five_hour"), 5*3600)
+	snapshot.Secondary = claudeWindow(ojson.GetBytes(body, "seven_day"), 7*24*3600)
 	snapshot.ExtraUsageEnabled = ojson.GetBytes(body, "extra_usage.is_enabled").Bool()
 }
 
-func claudeWindow(node ojson.Result) *coreauth.UsageWindow {
+func claudeWindow(node ojson.Result, windowSeconds int64) *coreauth.UsageWindow {
 	if !node.IsObject() || !node.Get("utilization").Exists() {
 		return nil
 	}
-	window := &coreauth.UsageWindow{UsedPercent: node.Get("utilization").Float()}
+	window := &coreauth.UsageWindow{UsedPercent: node.Get("utilization").Float(), WindowSeconds: windowSeconds}
 	if raw := strings.TrimSpace(node.Get("resets_at").String()); raw != "" {
 		if parsed, errParse := time.Parse(time.RFC3339Nano, raw); errParse == nil {
 			window.ResetAt = parsed.UTC()
@@ -290,7 +390,7 @@ func codexWindow(node ojson.Result) *coreauth.UsageWindow {
 	if !node.IsObject() {
 		return nil
 	}
-	window := &coreauth.UsageWindow{UsedPercent: node.Get("used_percent").Float()}
+	window := &coreauth.UsageWindow{UsedPercent: node.Get("used_percent").Float(), WindowSeconds: node.Get("limit_window_seconds").Int()}
 	if resetAt := node.Get("reset_at").Int(); resetAt > 0 {
 		window.ResetAt = time.Unix(resetAt, 0).UTC()
 	}
@@ -317,6 +417,12 @@ func describeWindow(w *coreauth.UsageWindow) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.0f%%@%s", w.UsedPercent, w.ResetAt.Format(time.RFC3339))
+}
+
+// loadState restores cached snapshots and retained history once per process.
+func (p *Poller) loadState(cacheFile string) {
+	p.loadCache(cacheFile)
+	p.loadHistory(historyFile(cacheFile))
 }
 
 func (p *Poller) loadCache(path string) {

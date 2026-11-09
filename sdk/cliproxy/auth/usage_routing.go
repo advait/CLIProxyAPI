@@ -23,6 +23,8 @@ import (
 type UsageWindow struct {
 	UsedPercent float64   `json:"used_percent"`
 	ResetAt     time.Time `json:"reset_at,omitempty"`
+	// WindowSeconds is the window length, used to project the reset after next.
+	WindowSeconds int64 `json:"window_seconds,omitempty"`
 }
 
 // remaining reports percent headroom, treating an elapsed reset as a fresh window
@@ -50,6 +52,7 @@ type UsageSnapshot struct {
 	AuthID    string    `json:"auth_id"`
 	Provider  string    `json:"provider"`
 	Email     string    `json:"email,omitempty"`
+	Plan      string    `json:"plan,omitempty"`
 	FetchedAt time.Time `json:"fetched_at"`
 	// Primary is the short window (Claude five_hour, Codex primary_window).
 	Primary *UsageWindow `json:"primary,omitempty"`
@@ -122,7 +125,57 @@ type usageRoutingState struct {
 	staleAfter time.Duration
 	retryAfter time.Duration
 	snapshots  map[string]UsageSnapshot
+	history    []UsageSample
 	nowFunc    func() time.Time
+}
+
+// UsageSample is one recorded usage observation, kept for the dashboard's history
+// chart and burn-rate estimates. Nil percentages mean the window was absent.
+type UsageSample struct {
+	At        time.Time `json:"t"`
+	AuthID    string    `json:"id"`
+	Primary   *float64  `json:"p,omitempty"`
+	Secondary *float64  `json:"s,omitempty"`
+}
+
+// UsageHistoryRetention bounds recorded usage history.
+const UsageHistoryRetention = 30 * 24 * time.Hour
+
+// SampleFromSnapshot converts a snapshot to a history sample.
+func SampleFromSnapshot(s UsageSnapshot) UsageSample {
+	sample := UsageSample{At: s.FetchedAt, AuthID: s.AuthID}
+	if s.Primary != nil {
+		v := s.Primary.UsedPercent
+		sample.Primary = &v
+	}
+	if s.Secondary != nil {
+		v := s.Secondary.UsedPercent
+		sample.Secondary = &v
+	}
+	return sample
+}
+
+// AppendUsageHistory records samples and drops those past retention.
+func AppendUsageHistory(samples ...UsageSample) {
+	usageRouting.mu.Lock()
+	defer usageRouting.mu.Unlock()
+	usageRouting.history = append(usageRouting.history, samples...)
+	cutoff := usageRouting.nowFunc().Add(-UsageHistoryRetention)
+	drop := 0
+	for drop < len(usageRouting.history) && usageRouting.history[drop].At.Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		usageRouting.history = append([]UsageSample(nil), usageRouting.history[drop:]...)
+	}
+}
+
+// UsageHistory returns samples recorded at or after since, oldest first.
+func UsageHistory(since time.Time) []UsageSample {
+	usageRouting.mu.RLock()
+	defer usageRouting.mu.RUnlock()
+	idx := sort.Search(len(usageRouting.history), func(i int) bool { return !usageRouting.history[i].At.Before(since) })
+	return append([]UsageSample(nil), usageRouting.history[idx:]...)
 }
 
 var usageRouting = &usageRoutingState{

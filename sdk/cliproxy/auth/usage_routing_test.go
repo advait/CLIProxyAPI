@@ -20,8 +20,9 @@ func withUsageRouting(t *testing.T, now time.Time) {
 		weights                UsageWeights
 		staleAfter, retryAfter time.Duration
 		snapshots              map[string]UsageSnapshot
+		history                []UsageSample
 		nowFunc                func() time.Time
-	}{usageRouting.enabled, usageRouting.weights, usageRouting.staleAfter, usageRouting.retryAfter, usageRouting.snapshots, usageRouting.nowFunc}
+	}{usageRouting.enabled, usageRouting.weights, usageRouting.staleAfter, usageRouting.retryAfter, usageRouting.snapshots, usageRouting.history, usageRouting.nowFunc}
 	usageRouting.enabled = true
 	usageRouting.weights = DefaultUsageWeights()
 	usageRouting.staleAfter = 15 * time.Minute
@@ -36,6 +37,7 @@ func withUsageRouting(t *testing.T, now time.Time) {
 		usageRouting.staleAfter = saved.staleAfter
 		usageRouting.retryAfter = saved.retryAfter
 		usageRouting.snapshots = saved.snapshots
+		usageRouting.history = saved.history
 		usageRouting.nowFunc = saved.nowFunc
 		usageRouting.mu.Unlock()
 	})
@@ -176,5 +178,26 @@ func TestManagerUsageAwareFailsOverBoundSessionWhenExhausted(t *testing.T) {
 	StoreUsageSnapshot(UsageSnapshot{AuthID: work, FetchedAt: now, Secondary: &UsageWindow{UsedPercent: 100, ResetAt: now.Add(time.Hour)}})
 	if got, errPick := pick("s3"); errPick == nil {
 		t.Fatalf("pick with all credentials exhausted = %v, want error", got)
+	}
+}
+
+func TestUsageHistoryRetentionAndSince(t *testing.T) {
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	withUsageRouting(t, now)
+	usageRouting.mu.Lock()
+	usageRouting.history = nil
+	usageRouting.mu.Unlock()
+	used := 40.0
+	AppendUsageHistory(
+		UsageSample{At: now.Add(-UsageHistoryRetention - time.Hour), AuthID: "old", Primary: &used},
+		UsageSample{At: now.Add(-2 * time.Hour), AuthID: "a", Primary: &used},
+		SampleFromSnapshot(UsageSnapshot{AuthID: "b", FetchedAt: now, Secondary: &UsageWindow{UsedPercent: 12}}),
+	)
+	all := UsageHistory(time.Time{})
+	if len(all) != 2 || all[0].AuthID != "a" || all[1].Secondary == nil || *all[1].Secondary != 12 || all[1].Primary != nil {
+		t.Fatalf("history = %+v, want expired sample dropped", all)
+	}
+	if recent := UsageHistory(now.Add(-time.Hour)); len(recent) != 1 || recent[0].AuthID != "b" {
+		t.Fatalf("since filter = %+v", recent)
 	}
 }
